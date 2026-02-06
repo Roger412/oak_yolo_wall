@@ -156,6 +156,16 @@ class OakYoloMinimal(Node):
         self._last_tick_time = time.time()
         self.watchdog = self.create_timer(1.0, self._watchdog)
         self.timer = self.create_timer(1.0 / fps, self._publish_tick)
+        self.caminfo_timer = self.create_timer(5.0, self._publish_camera_info)
+
+    def _publish_camera_info(self):
+        if self._cam_info_msg is None:
+            return
+
+        ci = deepcopy(self._cam_info_msg)
+        ci.header.stamp = self.get_clock().now().to_msg()
+        ci.header.frame_id = self.camera_frame
+        self.pub_info.publish(ci)
 
 
 
@@ -229,12 +239,6 @@ class OakYoloMinimal(Node):
 
             self._latest_rgb = None
             self._latest_det = None
-
-        if self.pub_info is not None and self._cam_info_msg is not None:
-            ci = deepcopy(self._cam_info_msg)
-            ci.header.stamp = self.get_clock().now().to_msg()   
-            ci.header.frame_id = self.camera_frame
-            self.pub_info.publish(ci)
 
         if self.publish_rgb and rgb_msg is not None and self.pub_rgb is not None:
             self.pub_rgb.publish(rgb_msg)
