@@ -61,7 +61,7 @@ from datetime import timedelta
 from sensor_msgs.msg import CameraInfo
 
 
-MODEL_PATH = "/robo_ws/src/oak_yolo_wall/blob_models/yolov8nseg_100e_512x288.rvc2_legacy.rvc2.tar.xz"
+MODEL_PATH = "/robo_ws/src/oak_yolo_wall/models/blob_models/yolov8nseg_300e_512x288.rvc2_legacy.rvc2.tar.xz"
 DEVICE = None
 
 class PipelineProxy:
@@ -186,7 +186,7 @@ class OakYolo(Node):
 
 
         # RGBD queue
-        self.q_rgb = self.nn_with_parser.passthrough.createOutputQueue(maxSize=4, blocking=False)
+        self.q_rgb = ( rgb_out.createOutputQueue(maxSize=1, blocking=False) if self.publish_rgb else None )
 
         # Output queue for detections
         self.q_det = self.nn_with_parser.out.createOutputQueue(maxSize=1, blocking=False)

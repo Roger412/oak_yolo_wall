@@ -1,38 +1,59 @@
 '''
 # ------------------------------------------------------------------------------
-# OakYoloMinimal ROS2 Node Summary
+# OakYoloMinimal ROS2 Node Summary (Updated)
 #
-# Minimal DepthAI + ROS2 bridge that runs an on-device YOLO instance-segmentation
-# network on rectified RGB frames (512x288) and publishes lightweight ROS outputs.
+# Minimal-yet-robust DepthAI → ROS2 bridge for Luxonis OAK cameras that runs an
+# on-device YOLO instance-segmentation network on rectified RGB frames (512x288)
+# and publishes lightweight ROS topics for downstream processing (tape polygons,
+# homography mapping, overlays, etc.). Optionally builds a stereo depth pipeline
+# aligned to RGB and publishes depth images at a configurable lower rate.
 #
-# Pipeline / inference:
-# - Creates a DepthAI pipeline with the RGB camera (rectified via enableUndistortion=True).
+# Pipeline / inference (RGB + YOLO):
+# - Creates a DepthAI pipeline with the RGB camera outputting rectified frames
+#   (enableUndistortion=True) at a configurable FPS.
 # - Loads a NN archive (MODEL_PATH) and runs ParsingNeuralNetwork on the RGB stream.
-# - Uses small, non-blocking host queues (maxSize=1 + tryGet drain) to avoid backlog.
+# - Uses small, non-blocking host output queues (maxSize=1 + tryGet “drain latest”)
+#   to avoid queue buildup/backpressure and keep latency low.
 #
-# Threading model:
-# - A dedicated reader thread performs all DepthAI queue reads and immediately converts
-#   packets into ROS messages (so DepthAI objects are not held across threads).
-# - A ROS timer publishes only the latest cached messages (RGB optional) at a fixed rate.
+# Optional depth (aligned stereo depth image):
+# - When enable_depth_image=True, builds a StereoDepth pipeline from CAM_B/C,
+#   rectifies/distortion-corrects, and aligns depth to the RGB stream.
+# - Publishes /oak/depth/image_raw as 16UC1 (mm) or 32FC1 (m) depending on output.
+# - Depth publishing can be throttled independently using depth_fps to reduce load
+#   (helpful on Jetson), while the stereo pipeline can still run at the RGB FPS.
+# - Publishes /oak/depth/camera_info periodically using RGB intrinsics (since depth
+#   is aligned to RGB).
+#
+# Threading model (freeze-resistant):
+# - A dedicated reader thread performs all DepthAI queue reads and immediately
+#   converts packets into ROS messages (so DepthAI objects are not retained across
+#   threads and no DepthAI calls happen inside ROS timer callbacks).
+# - A ROS publish timer pushes only the most recent cached messages (latest-only),
+#   keeping the node responsive even if downstream ROS consumers are slow.
 #
 # Published topics:
 # - /yolo/detections (yolo_seg_interfaces/YoloSegDetectionArray):
-#     Converts the NN instance mask output into polygons using OpenCV contours and
-#     publishes class/score + polygon + bbox-like fields per detection.
-# - /oak/rgb/camera_info (sensor_msgs/CameraInfo):
-#     Built once from DepthAI calibration intrinsics for the configured resolution and
-#     published periodically (independent of RGB publishing).
+#     Converts instance masks into polygons using OpenCV contours and publishes
+#     per-instance class_id/class_name/score, polygon vertices, and bbox-like fields.
 # - /oak/rgb/image_rect (sensor_msgs/Image) [optional]:
 #     Publishes rectified RGB frames when publish_rgb=True.
+# - /oak/rgb/camera_info (sensor_msgs/CameraInfo):
+#     Built once from DepthAI calibration intrinsics for 512x288 and published
+#     periodically (every 5 seconds) via a dedicated timer.
+# - /oak/depth/image_raw (sensor_msgs/Image) [optional]:
+#     Publishes aligned depth images when enable_depth_image=True (throttled by depth_fps).
+# - /oak/depth/camera_info (sensor_msgs/CameraInfo) [optional]:
+#     Published periodically (every 5 seconds) when depth is enabled.
 #
 # Debug / robustness:
-# - Logs host-side latency (time from DepthAI read to publish) at ~1 Hz.
+# - Logs host-side latency (time from DepthAI read → ROS publish) at ~1 Hz.
 # - Includes a simple watchdog that warns if the publish timer stops ticking.
-# - Enables faulthandler and SIGUSR1-triggered stack dumps for crash debugging.
+# - Enables faulthandler and SIGUSR1-triggered stack dumps for post-mortem debugging:
+#     kill -USR1 <pid>
 #
-# Non-features by design (compared to the larger node):
-# - No depth/stereo pipeline, no depth image, no PointCloud2, no overlay rendering,
-#   and no sequence-number matching between RGB and detections (latest-only behavior).
+# Non-features by design:
+# - No PointCloud2 generation, no overlay rendering, and no sequence-number matching
+#   between RGB and detections (latest-only behavior for simplicity and stability).
 # ------------------------------------------------------------------------------
 '''
 #!/usr/bin/env python3
@@ -64,7 +85,7 @@ import cv2
 import os
 
 
-MODEL_PATH = "/robo_ws/src/oak_yolo_wall/blob_models/yolov8nseg_100e_512x288.rvc2_legacy.rvc2.tar.xz"
+MODEL_PATH = "/robo_ws/src/oak_yolo_wall/models/blob_models/yolov8nseg_300e_512x288.rvc2_legacy.rvc2.tar.xz"
 DEVICE = None
 
 faulthandler.enable()
@@ -101,6 +122,11 @@ class OakYoloMinimal(Node):
         self.declare_parameter("camera_frame", "oak_rgb")
         self.camera_frame = str(self.get_parameter("camera_frame").value)
         self.class_names = ["red_striped_tape", "yellow_striped_tape"]
+        self.declare_parameter("enable_depth_image", False)
+        self.enable_depth_image = bool(self.get_parameter("enable_depth_image").value)
+        self.declare_parameter("depth_frame", "oak_depth")
+        self.depth_frame = str(self.get_parameter("depth_frame").value)
+
 
         # ----- publishers -----
         self.pub_rgb = ( self.create_publisher(Image, "/oak/rgb/image_rect", qos) if self.publish_rgb else None )
@@ -132,6 +158,22 @@ class OakYoloMinimal(Node):
 
         self.nn.build(rgb_out, nn_archive)
 
+        self.q_depth = None
+        self._depth_info_msg = None
+        self._latest_depth = None
+
+        if self.enable_depth_image:
+            self._build_depth_pipeline(rgb_out, fps)
+
+        # Optional Depth image params: publish depth slower than fps (helps Jetson)
+        self.declare_parameter("depth_fps", 10.0)
+        self.depth_fps = float(self.get_parameter("depth_fps").value)
+        self._depth_period = 1.0 / max(0.1, self.depth_fps)
+        self._last_depth_pub_t = 0.0
+        self.pub_depth = (self.create_publisher(Image, "/oak/depth/image_raw", qos) if self.enable_depth_image else None)
+        self.pub_depth_info = (self.create_publisher(CameraInfo, "/oak/depth/camera_info", qos) if self.enable_depth_image else None)
+
+
         # ----- Output queues -----
         self.q_rgb = ( rgb_out.createOutputQueue(maxSize=1, blocking=False) if self.publish_rgb else None )
 
@@ -157,6 +199,8 @@ class OakYoloMinimal(Node):
         self.watchdog = self.create_timer(1.0, self._watchdog)
         self.timer = self.create_timer(1.0 / fps, self._publish_tick)
         self.caminfo_timer = self.create_timer(5.0, self._publish_camera_info)
+        if self.enable_depth_image:
+            self.depthinfo_timer = self.create_timer(5.0, self._publish_depth_camera_info)
 
     def _publish_camera_info(self):
         if self._cam_info_msg is None:
@@ -182,14 +226,13 @@ class OakYoloMinimal(Node):
             #         continue
             try:        
                 # These are DepthAI calls -> keep them OUT of ROS timer thread.
-                if self.publish_rgb: 
-                    rgb_pkt = self._drain_latest(self.q_rgb)
-                else: 
-                    rgb_pkt = None
+                rgb_pkt = self._drain_latest(self.q_rgb) if self.publish_rgb else None
+
                 det_pkt = self._drain_latest(self.q_det)
 
+                depth_pkt = self._drain_latest(self.q_depth) if self.enable_depth_image else None
 
-                if rgb_pkt is None and det_pkt is None:
+                if rgb_pkt is None and det_pkt is None and depth_pkt is None:
                     time.sleep(0.001)
                     continue
 
@@ -212,6 +255,13 @@ class OakYoloMinimal(Node):
                     rgb_msg.header.stamp = stamp
                     rgb_msg.header.frame_id = self.camera_frame
 
+                depth_msg = None
+                if self.enable_depth_image and depth_pkt is not None:
+                    now_mono = time.monotonic()
+                    if (now_mono - self._last_depth_pub_t) >= self._depth_period:
+                        depth_msg = self._depth_pkt_to_msg(depth_pkt, stamp)
+                        self._last_depth_pub_t = now_mono
+
                 t_read = time.monotonic()
 
                 with self._latest_lock:
@@ -219,8 +269,10 @@ class OakYoloMinimal(Node):
                         self._latest_rgb = rgb_msg
                     if det_arr is not None:
                         self._latest_det = det_arr
+                    if depth_msg is not None:
+                        self._latest_depth = depth_msg
 
-                    self._latest_host_time = t_read     # ← THIS is the important part
+                    self._latest_host_time = t_read   
 
 
             except Exception:
@@ -235,16 +287,21 @@ class OakYoloMinimal(Node):
         with self._latest_lock:
             rgb_msg = self._latest_rgb
             det_msg = self._latest_det
+            depth_msg = self._latest_depth
             host_t  = self._latest_host_time
 
             self._latest_rgb = None
             self._latest_det = None
+            self._latest_depth = None
 
         if self.publish_rgb and rgb_msg is not None and self.pub_rgb is not None:
             self.pub_rgb.publish(rgb_msg)
 
         if det_msg is not None:
             self.pub_yolo.publish(det_msg)
+
+        if self.enable_depth_image and depth_msg is not None:
+            self.pub_depth.publish(depth_msg)
 
         t_pub = time.monotonic()
 
@@ -385,6 +442,89 @@ class OakYoloMinimal(Node):
             det_arr.detections.append(d)
 
         return det_arr
+
+    def _build_depth_pipeline(self, rgb_out, fps: float):
+        """
+        Conditionally builds a stereo depth pipeline aligned to RGB.
+        Creates:
+        - self.q_depth
+        - self._depth_info_msg
+        """
+        platform = self.device.getPlatform()
+
+        # --- Stereo cameras ---
+        left  = self.pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B)
+        right = self.pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_C)
+
+        stereo = self.pipeline.create(dai.node.StereoDepth)
+        stereo.setRectifyEdgeFillColor(0)
+        stereo.enableDistortionCorrection(True)
+        stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.DEFAULT)
+
+        # Keep range sane (mm)
+        stereo.initialConfig.postProcessing.thresholdFilter.maxRange = 10000
+
+        left.requestOutput((512, 288), fps=fps).link(stereo.left)
+        right.requestOutput((512, 288), fps=fps).link(stereo.right)
+
+        # --- Align depth to RGB ---
+        if platform.name == "RVC4":
+            align = self.pipeline.create(dai.node.ImageAlign)
+            stereo.depth.link(align.input)
+            rgb_out.link(align.inputAlignTo)
+            depth_out = align.outputAligned
+        else:
+            rgb_out.link(stereo.inputAlignTo)
+            depth_out = stereo.depth
+
+        # --- Output queue (latest-only) ---
+        self.q_depth = depth_out.createOutputQueue(
+            maxSize=1,
+            blocking=False
+        )
+
+        # --- Depth CameraInfo (aligned to RGB → use RGB intrinsics) ---
+        self._depth_info_msg = self._make_camera_info_msg(
+            width=512,
+            height=288,
+            frame_id=self.depth_frame,
+            socket=dai.CameraBoardSocket.RGB,
+        )
+
+    def _depth_pkt_to_msg(self, depth_pkt, stamp):
+        """
+        Convert a DepthAI depth packet into a ROS Image message.
+        Assumes depth is aligned to RGB and rectified.
+        """
+        if depth_pkt is None:
+            return None
+
+        depth = depth_pkt.getCvFrame()
+
+        # Most DepthAI pipelines output uint16 depth in millimeters
+        if depth.dtype == np.uint16:
+            msg = self.bridge.cv2_to_imgmsg(depth, encoding="16UC1")
+
+        # Some pipelines can output float depth in meters
+        elif depth.dtype == np.float32:
+            msg = self.bridge.cv2_to_imgmsg(depth, encoding="32FC1")
+
+        else:
+            # Fallback (rare, but safe)
+            msg = self.bridge.cv2_to_imgmsg(depth)
+
+        msg.header.stamp = stamp
+        msg.header.frame_id = self.depth_frame
+        return msg
+
+    def _publish_depth_camera_info(self):
+        if self.pub_depth_info is None or self._depth_info_msg is None:
+            return
+        ci = deepcopy(self._depth_info_msg)
+        ci.header.stamp = self.get_clock().now().to_msg()
+        ci.header.frame_id = self.depth_frame
+        self.pub_depth_info.publish(ci)
+
 
     def destroy_node(self):
         self._stop_evt.set()
