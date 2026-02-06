@@ -29,6 +29,7 @@ setup(
             'tape_wall_from_polygons = oak_yolo_wall.tape_wall_from_polygons:main',
             'tape_wall_polygons_homography = oak_yolo_wall.tape_wall_polygons_homography:main',
             'yolo_overlay_combiner = oak_yolo_wall.yolo_overlay_combiner:main',
+            'pcl_from_depth_polygon = oak_yolo_wall.pcl_from_depth_polygon:main',
         ],
     },
 )
